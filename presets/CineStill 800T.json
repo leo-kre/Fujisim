@@ -1,0 +1,33 @@
+{
+  "name": "CineStill 800T",
+  "source": "https://fujixweekly.com/2024/04/16/cinestill-800t-fujifilm-x-trans-v-film-simulation-recipe/",
+  "note": "ISO Auto bis 6400, Belichtungskorrektur ca. -1/3 bis +2/3",
+  "settings": {
+    "sim": "Eterna",
+    "dynamic_range": "DR400",
+    "highlight_tone": 0.0,
+    "shadow_tone": 2.0,
+    "color": 4.0,
+    "sharpness": -3.0,
+    "noise_reduction": -4.0,
+    "clarity": -5.0,
+    "grain_effect": "Strong",
+    "grain_size": "Large",
+    "color_chrome": "Strong",
+    "color_chrome_blue": "Weak",
+    "wb_mode": "Fluorescent 3",
+    "wb_kelvin": 5500.0,
+    "wb_shift_r": -6.0,
+    "wb_shift_b": -4.0,
+    "mono_filter": "none",
+    "mono_wc": 0.0,
+    "mono_mg": 0.0,
+    "intensity": 1.0,
+    "contrast": 0.0,
+    "halation": 0.0,
+    "bloom": 0.0,
+    "vignette": 0.0,
+    "lut_path": "",
+    "lut_strength": 1.0
+  }
+}

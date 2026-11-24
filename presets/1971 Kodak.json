@@ -1,0 +1,33 @@
+{
+  "name": "1971 Kodak",
+  "source": "https://fujixweekly.com/2026/03/25/1971-kodak-a-fujifilm-recipe-for-x-trans-v-cameras/",
+  "note": "ISO Auto bis 6400, Belichtungskorrektur ca. -1/3 bis +1/3",
+  "settings": {
+    "sim": "Nostalgic Neg.",
+    "dynamic_range": "DR100",
+    "highlight_tone": 2.0,
+    "shadow_tone": -2.0,
+    "color": -2.0,
+    "sharpness": -4.0,
+    "noise_reduction": -4.0,
+    "clarity": -4.0,
+    "grain_effect": "Weak",
+    "grain_size": "Large",
+    "color_chrome": "Strong",
+    "color_chrome_blue": "Weak",
+    "wb_mode": "Kelvin",
+    "wb_kelvin": 5900.0,
+    "wb_shift_r": -1.0,
+    "wb_shift_b": -6.0,
+    "mono_filter": "none",
+    "mono_wc": 0.0,
+    "mono_mg": 0.0,
+    "intensity": 1.0,
+    "contrast": 0.0,
+    "halation": 0.0,
+    "bloom": 0.0,
+    "vignette": 0.0,
+    "lut_path": "",
+    "lut_strength": 1.0
+  }
+}

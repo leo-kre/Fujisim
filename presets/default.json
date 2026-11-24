@@ -1,0 +1,33 @@
+{
+  "name": "default",
+  "source": "",
+  "note": "",
+  "settings": {
+    "sim": "Classic Chrome",
+    "dynamic_range": "DR100",
+    "highlight_tone": 0.0,
+    "shadow_tone": -2.0,
+    "color": 2.0,
+    "sharpness": 0.0,
+    "noise_reduction": 0.0,
+    "clarity": -1.0,
+    "grain_effect": "Strong",
+    "grain_size": "Large",
+    "color_chrome": "Strong",
+    "color_chrome_blue": "Strong",
+    "wb_mode": "Auto",
+    "wb_kelvin": 5500.0,
+    "wb_shift_r": 0.0,
+    "wb_shift_b": 0.0,
+    "mono_filter": "none",
+    "mono_wc": 0.0,
+    "mono_mg": 0.0,
+    "intensity": 1.0,
+    "contrast": 100.0,
+    "halation": 0.02,
+    "bloom": 0.08,
+    "vignette": 0.0,
+    "lut_path": "",
+    "lut_strength": 1.0
+  }
+}
