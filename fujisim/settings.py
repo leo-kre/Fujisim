@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, asdict, fields
+from dataclasses import dataclass, asdict, field, fields
 
 DR_CHOICES = ["DR100", "DR200", "DR400"]
 EFFECT_CHOICES = ["Off", "Weak", "Strong"]
@@ -48,6 +48,41 @@ class EditSettings:
     vignette: float = 0.0               # 0..1
     lut_path: str = ""                  # eigene .cube-LUT (nach dem Look)
     lut_strength: float = 1.0
+    # --- Grundlagen (wie Lightroom) ---
+    saturation: float = 0.0             # -100..100
+    vibrance: float = 0.0               # -100..100
+    whites: float = 0.0                 # -100..100
+    blacks: float = 0.0                 # -100..100
+    # --- Farbkorrektur (Color Grading): je Zone Farbton (Grad), Saettigung 0..100, Luminanz -100..100 ---
+    cg_sh_h: float = 0.0
+    cg_sh_s: float = 0.0
+    cg_sh_l: float = 0.0
+    cg_mid_h: float = 0.0
+    cg_mid_s: float = 0.0
+    cg_mid_l: float = 0.0
+    cg_hi_h: float = 0.0
+    cg_hi_s: float = 0.0
+    cg_hi_l: float = 0.0
+    cg_gl_h: float = 0.0
+    cg_gl_s: float = 0.0
+    cg_gl_l: float = 0.0
+    cg_blend: float = 50.0              # 0..100
+    cg_balance: float = 0.0             # -100..100
+    # --- Tonkurve: Punkte (x, y) in 0..1; RGB-Master + Einzelkanaele ---
+    curve: list = field(default_factory=lambda: [[0.0, 0.0], [1.0, 1.0]])
+    curve_r: list = field(default_factory=lambda: [[0.0, 0.0], [1.0, 1.0]])
+    curve_g: list = field(default_factory=lambda: [[0.0, 0.0], [1.0, 1.0]])
+    curve_b: list = field(default_factory=lambda: [[0.0, 0.0], [1.0, 1.0]])
+    # --- Geometrie ---
+    angle: float = 0.0                  # Gerade ausrichten, Grad (positiv = im Uhrzeigersinn), -45..45
+    rot90: int = 0                      # Viertelumdrehungen im Uhrzeigersinn (0..3)
+    flip_h: bool = False
+    flip_v: bool = False
+    crop_x: float = 0.0                 # Zuschnitt als Anteil der (gedrehten) Arbeitsflaeche
+    crop_y: float = 0.0
+    crop_w: float = 1.0
+    crop_h: float = 1.0
+    crop_aspect: str = "Original"       # nur Voreinstellung fuer den Zuschnitt-Dialog
 
     def copy(self) -> "EditSettings":
         return EditSettings(**asdict(self))
@@ -66,6 +101,7 @@ class EditSettings:
 
 
 # Bei "Apply to all" optional pro Bild behalten
+GEOMETRY_KEYS = ("angle", "rot90", "flip_h", "flip_v", "crop_x", "crop_y", "crop_w", "crop_h", "crop_aspect")
 PER_IMAGE_KEYS = ("auto_exposure", "exposure", "wb_mode", "wb_kelvin", "wb_shift_r", "wb_shift_b")
 
 

@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from PIL import Image
 
-from . import flog, lut as lutmod, raw_io
+from . import flog, geometry, lut as lutmod, raw_io
 from .pipeline import Ctx, margin_px, process_region
 from .settings import EditSettings
 
@@ -122,46 +122,84 @@ class ImageSession:
         return out
 
     # ---- Rendern ----
+    def out_size(self, s: EditSettings) -> tuple[int, int]:
+        """Groesse des bearbeiteten Bildes (nach Drehen/Zuschnitt) bei Zoom 1."""
+        return geometry.out_size(s, self.W, self.H)
+
     def render(self, s: EditSettings, z: float, X0: int, Y0: int, cw: int, ch: int) -> np.ndarray:
-        """Ausschnitt [X0,X0+cw) x [Y0,Y0+ch) im Ausgabegitter (Gesamtbild = W*z x H*z)."""
-        Wz, Hz = self.W * z, self.H * z
+        """Ausschnitt [X0,X0+cw) x [Y0,Y0+ch) im Ausgabegitter (Ergebnisbild = out_size * z)."""
+        ow, oh = self.out_size(s)
+        Wz, Hz = ow * z, oh * z
         iw, ih = max(1, int(round(Wz))), max(1, int(round(Hz)))
         X0, Y0 = max(0, X0), max(0, Y0)
         cw, ch = min(cw, iw - X0), min(ch, ih - Y0)
         m = margin_px(s, max(Wz, Hz))
         xa, ya = max(0, X0 - m), max(0, Y0 - m)
         xb, yb = min(iw, X0 + cw + m), min(ih, Y0 + ch + m)
-        ctx = Ctx(z, Wz, Hz, xa, ya, self.seed, self.gain, self.ratio)
-        lin = self._extract(z, xa, ya, xb - xa, yb - ya)
+        ctx = Ctx(z, iw, ih, xa, ya, self.seed, self.gain, self.ratio)
+        if geometry.is_identity(s):
+            lin = self._extract(z, xa, ya, xb - xa, yb - ya)
+        else:
+            sw, sh = self.W * z, self.H * z
+            bbox = geometry.source_bbox(s, sw, sh, z, xa, ya, xb - xa, yb - ya)
+            src = self._extract(z, *bbox)
+            lin = geometry.warp(src, s, sw, sh, z, bbox, xa, ya, xb - xa, yb - ya)
         out = process_region(lin, s, ctx, flog.official_lut(s.sim), get_lut(s.lut_path))
         return out[Y0 - ya: Y0 - ya + ch, X0 - xa: X0 - xa + cw]
 
 
+def resize_zoom(ow: int, oh: int, resize) -> float:
+    """Zoom fuer den Export. resize: None | ("long"|"short"|"width"|"height"|"percent", v) | ("fit", w, h)."""
+    if not resize:
+        return 1.0
+    kind = resize[0]
+    if kind == "long":
+        return resize[1] / max(ow, oh)
+    if kind == "short":
+        return resize[1] / min(ow, oh)
+    if kind == "width":
+        return resize[1] / ow
+    if kind == "height":
+        return resize[1] / oh
+    if kind == "percent":
+        return resize[1] / 100.0
+    if kind == "fit":
+        return min(resize[1] / ow, resize[2] / oh)
+    return 1.0
+
+
 def export_file(path: str, s: EditSettings, out_path: str, quality: int = 95, max_edge: int = 0,
-                tile: int = 1024) -> None:
-    """Voller Export, kachelweise. Haelt nur dieses eine Bild."""
+                tile: int = 1024, resize=None, no_upscale: bool = True) -> None:
+    """Voller Export, kachelweise. Haelt nur dieses eine Bild. Zuschnitt/Drehung stecken in `s`."""
     sess = ImageSession(path)
     rgb, sess.ratio = raw_io._decode(path, half=False)
     sess.W, sess.H = rgb.shape[1], rgb.shape[0]
     cg, _ = raw_io.camera_gain(path)
     sess.gain = cg if cg else raw_io.auto_gain(rgb[::4, ::4])
     sess.levels = {0: rgb}
-    z = 1.0
-    if max_edge and max(sess.W, sess.H) > max_edge:
-        z = max_edge / max(sess.W, sess.H)
+    ow, oh = sess.out_size(s)
+    if max_edge and not resize:
+        resize = ("long", max_edge)
+    z = resize_zoom(ow, oh, resize)
+    if no_upscale and z > 1.0:
+        z = 1.0
+    if z < 1.0:
         sess._build(0)
-    iw, ih = int(round(sess.W * z)), int(round(sess.H * z))
+    iw, ih = max(1, int(round(ow * z))), max(1, int(round(oh * z)))
     out = np.empty((ih, iw, 3), np.uint8)
     for y in range(0, ih, tile):
         th = min(tile, ih - y)
         out[y:y + th] = sess.render(s, z, 0, y, iw, th)
     del sess, rgb
     img = Image.fromarray(out)
-    if out_path.lower().endswith((".jpg", ".jpeg")):
+    low = out_path.lower()
+    if low.endswith((".jpg", ".jpeg")):
         exif = raw_io.read_exif(path)
         kw = {"quality": quality, "subsampling": 0, "optimize": True}
         if exif:
             kw["exif"] = exif
         img.save(out_path, "JPEG", **kw)
+    elif low.endswith((".tif", ".tiff")):
+        img.save(out_path, compression="tiff_lzw")
     else:
         img.save(out_path)

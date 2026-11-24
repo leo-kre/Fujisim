@@ -1,0 +1,107 @@
+{
+  "name": "XTra-V",
+  "source": "",
+  "note": "",
+  "settings": {
+    "sim": "Nostalgic Neg.",
+    "dynamic_range": "DR100",
+    "highlight_tone": 0.0,
+    "shadow_tone": 0.0,
+    "color": 2.0,
+    "sharpness": -4.0,
+    "noise_reduction": -4.0,
+    "clarity": -1.0,
+    "grain_effect": "Strong",
+    "grain_size": "Large",
+    "color_chrome": "Strong",
+    "color_chrome_blue": "Strong",
+    "wb_mode": "Auto",
+    "wb_kelvin": 5500.0,
+    "wb_shift_r": 0.0,
+    "wb_shift_b": 0.0,
+    "mono_filter": "none",
+    "mono_wc": 0.0,
+    "mono_mg": 0.0,
+    "intensity": 1.0,
+    "contrast": 40.0,
+    "halation": 0.05,
+    "bloom": 0.24,
+    "vignette": 0.0,
+    "lut_path": "",
+    "lut_strength": 1.0,
+    "saturation": -15.0,
+    "vibrance": 0.0,
+    "whites": 100.0,
+    "blacks": 0.0,
+    "cg_sh_h": 0.0,
+    "cg_sh_s": 0.0,
+    "cg_sh_l": 0.0,
+    "cg_mid_h": 0.0,
+    "cg_mid_s": 0.0,
+    "cg_mid_l": 0.0,
+    "cg_hi_h": 0.0,
+    "cg_hi_s": 0.0,
+    "cg_hi_l": 0.0,
+    "cg_gl_h": 0.0,
+    "cg_gl_s": 0.0,
+    "cg_gl_l": 0.0,
+    "cg_blend": 50.0,
+    "cg_balance": 0.0,
+    "curve": [
+      [
+        0.0,
+        0.0
+      ],
+      [
+        0.07749720982142858,
+        0.12845982142857143
+      ],
+      [
+        0.18875558035714285,
+        0.32631138392857145
+      ],
+      [
+        0.4410853794642857,
+        0.5563755580357143
+      ],
+      [
+        0.7109235491071428,
+        0.7969447544642857
+      ],
+      [
+        1.0,
+        1.0
+      ]
+    ],
+    "curve_r": [
+      [
+        0.0,
+        0.0
+      ],
+      [
+        1.0,
+        1.0
+      ]
+    ],
+    "curve_g": [
+      [
+        0.0,
+        0.0
+      ],
+      [
+        1.0,
+        1.0
+      ]
+    ],
+    "curve_b": [
+      [
+        0.0,
+        0.0
+      ],
+      [
+        1.0,
+        1.0
+      ]
+    ]
+  }
+}
