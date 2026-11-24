@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from . import effects, flog, kernels
+from . import effects, flog, grading, kernels
 from .film import BAND_CENTERS, FILMS, MONO_FILTERS
 from .settings import EditSettings, WB_KELVIN
 
@@ -22,6 +22,10 @@ CHROME_AMOUNT = {"Off": 0.0, "Weak": 0.5, "Strong": 1.0}
 # DR200/400: NICHT gemessen (keine Referenzdaten). Mildes Knie erst ab ~1.5 Blenden ueber Mittelgrau.
 DR_ROLL = {"DR100": 1.0, "DR200": 0.75, "DR400": 0.55}
 DR_KNEE = 0.5
+# DR400: gemessen an 5 Rezepten auf derselben Aufnahme (fujixweekly, GFX100S II): Kamera hebt Schatten/Mitten gegenueber
+# dem Modell um bis zu +12 % des Displaywerts (Luma-Rest bei e=0.08/0.25/0.42/0.58/0.75/0.92: +8/+11/+12/+8/+3.5/+1.6 %).
+# DR200 zeigte keinen Rest (Nostalgic Americana) -> keine Anhebung.
+DR_LIFT = {"DR400": ([0.0, 0.08, 0.25, 0.42, 0.58, 0.75, 0.92, 1.0], [0.043, 0.07, 0.091, 0.102, 0.071, 0.030, 0.014, 0.0])}
 LUMA_S = np.array([0.2126, 0.7152, 0.0722], F32)
 _NEUTRAL_BANDS = np.zeros((3, 8))
 
@@ -54,14 +58,19 @@ def sigmoid_params(c: float):
     return k, g0, g1
 
 
+KELVIN_STRENGTH = 0.4     # Exponent auf die Kelvin-Gains: Kamera wirkt deutlich schwaecher als "Licht neutralisieren" (7 Rezepte, eine Szene)
+SHIFT_STEP_R = 0.05       # log2 pro WB-Shift-Stufe
+SHIFT_STEP_B = 0.08       # Blau-Shift wirkt staerker als Rot (gleiche 7 Rezepte; Rot 0.05 beibehalten)
+
+
 def wb_gains(s: EditSettings, ratio) -> np.ndarray:
     g = np.ones(3, F32)
     if s.wb_mode != "Auto":
         if ratio is not None:
             g = g * np.asarray(ratio, F32)
         k = s.wb_kelvin if s.wb_mode == "Kelvin" else WB_KELVIN.get(s.wb_mode, 5500)
-        g = g * flog.kelvin_gains(k)
-    return g * np.array([2 ** (0.05 * s.wb_shift_r), 1.0, 2 ** (0.05 * s.wb_shift_b)], F32)
+        g = g * np.power(flog.kelvin_gains(k), KELVIN_STRENGTH).astype(F32)
+    return g * np.array([2 ** (SHIFT_STEP_R * s.wb_shift_r), 1.0, 2 ** (SHIFT_STEP_B * s.wb_shift_b)], F32)
 
 
 def _parametric_tone(x, look):
@@ -83,7 +92,7 @@ def margin_px(s: EditSettings, long_px: float) -> int:
     if s.halation > 0 or s.bloom > 0:
         m = max(m, int(0.08 * long_px))
     if s.clarity:
-        m = max(m, int(0.03 * long_px))
+        m = max(m, int(0.08 * long_px))
     return m
 
 
@@ -135,6 +144,24 @@ def process_region(lin: np.ndarray, s: EditSettings, ctx: Ctx, fuji_lut=None, cu
             e = np.repeat((e @ mono_w)[..., None], 3, -1)
         bands, sat_base, do_tints = look.bands, look.sat, True
 
+    # ---- Grundlagen: Weiss-/Schwarzpunkt, Sättigung, Vibrance (nicht bei Monochrom) ----
+    if s.whites or s.blacks:
+        bp, wp = -0.06 * s.blacks / 100.0, 1.0 - 0.06 * s.whites / 100.0
+        e = ((np.clip(e, 0, 1) - bp) / max(wp - bp, 0.2)).astype(F32)
+    if (s.saturation or s.vibrance) and not is_mono:
+        e = np.clip(e, 0, 1)
+        yv = (e @ LUMA_S)[..., None]
+        k = np.full(e.shape[:2] + (1,), 1.0 + s.saturation / 100.0, F32)
+        if s.vibrance:
+            mx, mn = e.max(-1, keepdims=True), e.min(-1, keepdims=True)
+            k = k * (1.0 + (s.vibrance / 100.0) * (1.0 - (mx - mn) / np.maximum(mx, 1e-4)))
+        e = (yv + (e - yv) * k).astype(F32)
+
+    lift = DR_LIFT.get(s.dynamic_range)
+    if lift is not None and not is_mono:
+        e = np.clip(e, 0, 1)
+        e = (e + np.interp(e, lift[0], lift[1]).astype(F32)).astype(F32)
+
     # ---- Grading (Tonwerte, Kontrast, Farbe) ----
     chrome = CHROME_AMOUNT[s.color_chrome]
     cblue = CHROME_AMOUNT[s.color_chrome_blue]
@@ -151,6 +178,17 @@ def process_region(lin: np.ndarray, s: EditSettings, ctx: Ctx, fuji_lut=None, cu
                     BAND_CENTERS.astype(np.float64), np.array(look.shadow_tint, np.float64),
                     np.array(look.highlight_tint, np.float64), tone, flags)
 
+    # ---- Tonkurve + Color Grading (Display-Raum, nach dem Look) ----
+    curves = [s.curve, s.curve_r, s.curve_g, s.curve_b]
+    do_curve = not all(grading.curve_is_identity(c) for c in curves)
+    do_cg = grading.has_grading(s)
+    if do_curve or do_cg:
+        if do_curve:
+            e = grading.apply_curves(e, *curves)
+        if do_cg:
+            e = grading.color_grade(e, s)
+        y = (np.clip(e, 0, 1) @ LUMA_S).astype(F32)
+
     # ---- eigene LUT (Zusatz) ----
     if custom_lut is not None and s.lut_strength > 0:
         from . import lut as lutmod
@@ -162,7 +200,7 @@ def process_region(lin: np.ndarray, s: EditSettings, ctx: Ctx, fuji_lut=None, cu
     dummy3 = np.zeros((1, 1, 3), F32)
     yc = dummy2
     if s.clarity:
-        yc = effects.blur(y, 0.012 * long_px)
+        yc = effects.blur(y, 0.025 * long_px)
     sharp_amt = max(0.0, 0.4 + 0.25 * s.sharpness)
     sig_s = 0.0004 * long_px
     use_sharp = sharp_amt > 0 and sig_s >= 0.35
@@ -175,7 +213,7 @@ def process_region(lin: np.ndarray, s: EditSettings, ctx: Ctx, fuji_lut=None, cu
         g_amt *= cell
         cell = 1.0
     out = np.empty((h, w, 3), np.uint8)
-    kernels.k_finish(e, y, yc, ys, enr, out, 0.06 * s.clarity, sharp_amt, min(1.0, 0.07 * s.noise_reduction),
+    kernels.k_finish(e, y, yc, ys, enr, out, 0.036 * s.clarity, sharp_amt, min(1.0, 0.07 * s.noise_reduction),
                      g_amt, cell, 0.3, int(ctx.seed) & 0x7FFFFFFF, float(ctx.ox), float(ctx.oy),
                      bool(is_mono), bool(s.clarity), bool(use_sharp), bool(use_nr))
     return out

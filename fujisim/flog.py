@@ -104,6 +104,9 @@ LUT_FILES = {
     "Acros": ["ACROS.cube"],
 }
 
+# Looks ohne eigene LUT: Basis-LUT + gelernte Korrektur (aus der 20-Sims-Vergleichsgrafik, siehe calibration/RESULTS.md)
+DERIVED = {"Pro Neg. Hi": "Pro Neg. Std", "Nostalgic Neg.": "Reala Ace"}
+
 _CONFIG = Path.home() / ".fujisim.json"
 _cache: dict[str, lutmod.Lut] = {}
 
@@ -133,6 +136,7 @@ def set_lut_dir(path: str) -> None:
 
 def official_lut(sim: str):
     """Liefert die offizielle Fuji-LUT fuer `sim` oder None."""
+    sim = DERIVED.get(sim, sim)
     d = lut_dir()
     for name in LUT_FILES.get(sim, []):
         p = d / name

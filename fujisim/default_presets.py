@@ -187,4 +187,18 @@ High ISO NR: -4
 Clarity: -2""",
      _W + "2024/03/27/pro-negative-160c-fujifilm-x100vi-film-simulation-recipe/",
      "ISO Auto bis 6400, Belichtungskorrektur ca. 0 bis +2/3 (X100VI/GFX100 II, X-Trans V)"),
+    ("Pacific Blues", """Film Simulation: Classic Neg.
+Dynamic Range: DR400
+Highlight: -2
+Shadow: +3
+Color: +4
+Noise Reduction: -4
+Sharpening: -2
+Clarity: -3
+Grain Effect: Strong, Large
+Color Chrome Effect: Strong
+Color Chrome FX Blue: Strong
+White Balance: 5800K, +1 Red & -3 Blue""",
+     _W + "2022/08/04/fujifilm-x-e4-x-trans-iv-film-simulation-recipe-pacific-blues/",
+     "X-E4 (X-Trans IV): ISO Auto bis 6400, Belichtungskorrektur ca. +2/3 bis +1"),
 ]

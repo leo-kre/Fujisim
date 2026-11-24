@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import gc
+import math
+from dataclasses import asdict
 import json
 import os
 import sys
@@ -10,20 +12,21 @@ import time
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QBuffer, QSettings, QObject, QRectF, QSize, QRunnable, Qt, QThread, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QAction, QKeySequence, QShortcut, QColor, QIcon, QImage, QImageReader, QPainter, QPalette, QPixmap
+from PySide6.QtCore import QBuffer, QPointF, QSettings, QObject, QRectF, QSize, QRunnable, Qt, QThread, QThreadPool, QTimer, Signal
+from PySide6.QtGui import (QAction, QBrush, QConicalGradient, QCursor, QKeySequence, QPen, QPolygonF,
+                           QRadialGradient, QShortcut, QColor, QIcon, QImage, QImageReader, QPainter, QPalette, QPixmap)
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
     QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressDialog,
     QInputDialog, QPlainTextEdit, QPushButton, QScrollArea, QSlider, QSplitter, QVBoxLayout, QWidget, QDialog,
-    QDialogButtonBox,
+    QDialogButtonBox, QGridLayout, QSpinBox,
 )
 
 from . import raw_io
-from . import flog, presets, recipe
-from .engine import ImageSession, export_file
+from . import flog, geometry, grading, presets, recipe
+from .engine import ImageSession, export_file, resize_zoom
 from .film import FILMS
-from .settings import (DR_CHOICES, EFFECT_CHOICES, GRAIN_SIZES, MONO_FILTERS_LIST, PER_IMAGE_KEYS,
+from .settings import (DR_CHOICES, EFFECT_CHOICES, GEOMETRY_KEYS, GRAIN_SIZES, MONO_FILTERS_LIST, PER_IMAGE_KEYS,
                        WB_MODES, EditSettings, app_defaults)
 
 THUMB_W, THUMB_H = 200, 134      # Rahmen der Filmstreifen-Vorschau (Hoch- und Querformat passen hinein)
@@ -37,6 +40,16 @@ SLIDER_GROUPS = [
         ("clarity", "Clarity", -5, 5, 1, 0),
         ("sharpness", "Sharpness", -4, 4, 1, 0),
         ("noise_reduction", "Noise Reduction", -4, 4, 1, 0),
+    ]),
+    ("Grundlagen", [
+        ("saturation", "Sättigung", -100, 100, 1, 0),
+        ("vibrance", "Dynamik (Vibrance)", -100, 100, 1, 0),
+        ("whites", "Weiß", -100, 100, 1, 0),
+        ("blacks", "Schwarz", -100, 100, 1, 0),
+    ]),
+    ("Color Grading: Mischung", [
+        ("cg_blend", "Überblendung", 0, 100, 1, 0),
+        ("cg_balance", "Balance (Schatten ↔ Lichter)", -100, 100, 1, 0),
     ]),
     ("Fuji: Weißabgleich", [
         ("wb_kelvin", "Kelvin", 25, 100, 0.01, 0),
@@ -56,6 +69,7 @@ SLIDER_GROUPS = [
         ("vignette", "Vignette", 0, 100, 100, 2),
     ]),
     ("Eigene LUT (optional, .cube)", [("lut_strength", "LUT-Stärke", 0, 100, 100, 2)]),
+    ("Geometrie: Zuschneiden && Drehen", [("angle", "Gerade ausrichten (°)", -450, 450, 10, 1)]),
 ]
 
 # key, Label, Auswahl
@@ -185,10 +199,10 @@ class ThumbWorker(QThread):
 
 
 class ExportTask(QRunnable):
-    def __init__(self, win, jobs, outdir, fmt, quality, max_edge):
+    def __init__(self, win, jobs, outdir, fmt, quality, resize=None, no_upscale=True):
         super().__init__()
         self.win, self.jobs, self.outdir = win, jobs, outdir
-        self.fmt, self.quality, self.max_edge = fmt, quality, max_edge
+        self.fmt, self.quality, self.resize, self.no_upscale = fmt, quality, resize, no_upscale
         self.cancel = False
 
     def run(self):
@@ -199,7 +213,7 @@ class ExportTask(QRunnable):
             self.win.sig.export_progress.emit(i, os.path.basename(path))
             dst = Path(self.outdir) / f"{Path(path).stem}_{s.sim.replace(' ', '').replace('.', '')}.{self.fmt}"
             try:
-                export_file(path, s, str(dst), self.quality, self.max_edge)
+                export_file(path, s, str(dst), self.quality, resize=self.resize, no_upscale=self.no_upscale)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{os.path.basename(path)}: {exc}")
         self.win.sig.export_done.emit(len(self.jobs), errors)
@@ -217,10 +231,18 @@ class ImageView(QWidget):
     Bildkoordinaten sind Originalpixel; `zoom` = Geraetepixel pro Originalpixel.
     """
     viewChanged = Signal()
+    cropChanged = Signal(object)      # (x, y, w, h) normiert auf die Arbeitsflaeche
+    cropDone = Signal()
 
     def __init__(self):
         super().__init__()
         self.setMinimumSize(400, 300)
+        self.setMouseTracking(True)
+        self.crop_mode = False
+        self.crop_rect = (0.0, 0.0, 1.0, 1.0)
+        self.crop_ratio = 0.0         # Breite/Hoehe, 0 = frei
+        self.crop_ok = None           # Pruefung (rect) -> bool, z. B. "liegt im gedrehten Bild"
+        self._cdrag = None
         self.setFocusPolicy(Qt.StrongFocus)
         self.W = self.H = 0
         self.fit = True
@@ -304,6 +326,126 @@ class ImageView(QWidget):
                      self.img.width() * sx / r, self.img.height() * sx / r)
         p.setRenderHint(QPainter.SmoothPixmapTransform, abs(sx - 1) > 1e-3)
         p.drawImage(tgt, self.img)
+        if self.crop_mode:
+            self._paint_crop(p)
+
+    # -- Zuschneiden: Overlay + Bedienung
+    def _wrect(self):
+        """Zuschnitt in Widget-Koordinaten (x0, y0, x1, y1)."""
+        z, left, top, _, _ = self.vrect()
+        r = self.devicePixelRatioF()
+        x, y, w, h = self.crop_rect
+        f = lambda X, Y: ((X - left) * z / r, (Y - top) * z / r)  # noqa: E731
+        a, b = f(x * self.W, y * self.H)
+        c, d = f((x + w) * self.W, (y + h) * self.H)
+        return a, b, c, d
+
+    def _paint_crop(self, p):
+        x0, y0, x1, y1 = self._wrect()
+        W, Hh = self.width(), self.height()
+        dim = QColor(0, 0, 0, 150)
+        p.fillRect(QRectF(0, 0, W, max(0, y0)), dim)
+        p.fillRect(QRectF(0, y1, W, max(0, Hh - y1)), dim)
+        p.fillRect(QRectF(0, y0, max(0, x0), y1 - y0), dim)
+        p.fillRect(QRectF(x1, y0, max(0, W - x1), y1 - y0), dim)
+        p.setPen(QPen(QColor(255, 255, 255, 230), 1.5))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(QRectF(x0, y0, x1 - x0, y1 - y0))
+        p.setPen(QPen(QColor(255, 255, 255, 90), 1))
+        for k in (1, 2):
+            p.drawLine(x0 + (x1 - x0) * k / 3, y0, x0 + (x1 - x0) * k / 3, y1)
+            p.drawLine(x0, y0 + (y1 - y0) * k / 3, x1, y0 + (y1 - y0) * k / 3)
+        p.setPen(QPen(QColor(30, 30, 30), 1))
+        p.setBrush(QColor(255, 255, 255))
+        for hx, hy in self._handles(x0, y0, x1, y1).values():
+            p.drawRect(QRectF(hx - 4, hy - 4, 8, 8))
+
+    @staticmethod
+    def _handles(x0, y0, x1, y1):
+        mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+        return {"tl": (x0, y0), "t": (mx, y0), "tr": (x1, y0), "r": (x1, my),
+                "br": (x1, y1), "b": (mx, y1), "bl": (x0, y1), "l": (x0, my)}
+
+    def _hit(self, pos):
+        x0, y0, x1, y1 = self._wrect()
+        for name, (hx, hy) in self._handles(x0, y0, x1, y1).items():
+            if abs(pos.x() - hx) <= 9 and abs(pos.y() - hy) <= 9:
+                return name
+        if x0 <= pos.x() <= x1 and y0 <= pos.y() <= y1:
+            return "move"
+        return None
+
+    def _to_image(self, pos):
+        z, left, top, _, _ = self.vrect()
+        r = self.devicePixelRatioF()
+        return left + pos.x() * r / z, top + pos.y() * r / z
+
+    def _crop_press(self, e):
+        hit = self._hit(e.position())
+        if hit:
+            X, Y = self._to_image(e.position())
+            x, y, w, h = self.crop_rect
+            self._cdrag = (hit, X, Y, (x * self.W, y * self.H, (x + w) * self.W, (y + h) * self.H))
+
+    def _crop_move(self, e):
+        W, H = float(self.W), float(self.H)
+        if not self._cdrag:
+            cur = {"tl": Qt.SizeFDiagCursor, "br": Qt.SizeFDiagCursor, "tr": Qt.SizeBDiagCursor,
+                   "bl": Qt.SizeBDiagCursor, "t": Qt.SizeVerCursor, "b": Qt.SizeVerCursor,
+                   "l": Qt.SizeHorCursor, "r": Qt.SizeHorCursor, "move": Qt.SizeAllCursor}.get(self._hit(e.position()))
+            self.setCursor(QCursor(cur) if cur else QCursor(Qt.ArrowCursor))
+            return
+        hit, X0, Y0, (a, b, c, d) = self._cdrag
+        X, Y = self._to_image(e.position())
+        dx, dy = X - X0, Y - Y0
+        ratio = self.crop_ratio
+        MIN = 24.0
+        if hit == "move":
+            w, h = c - a, d - b
+            na = min(max(a + dx, 0.0), W - w)
+            nb = min(max(b + dy, 0.0), H - h)
+            cand = (na, nb, na + w, nb + h)
+        else:
+            if "l" in hit:
+                a = min(a + dx, c - MIN)
+            if "r" in hit:
+                c = max(c + dx, a + MIN)
+            if "t" in hit:
+                b = min(b + dy, d - MIN)
+            if "b" in hit:
+                d = max(d + dy, b + MIN)
+            if ratio > 0:
+                w, h = c - a, d - b
+                if len(hit) == 2:                          # Ecke: gegenueberliegende Ecke bleibt
+                    if w / h > ratio:
+                        w = h * ratio
+                    else:
+                        h = w / ratio
+                    if "l" in hit:
+                        a = c - w
+                    else:
+                        c = a + w
+                    if "t" in hit:
+                        b = d - h
+                    else:
+                        d = b + h
+                elif hit in ("l", "r"):                  # Kante: Hoehe folgt, um die Mitte
+                    h = w / ratio
+                    my = (b + d) / 2
+                    b, d = my - h / 2, my + h / 2
+                else:
+                    w = h * ratio
+                    mx = (a + c) / 2
+                    a, c = mx - w / 2, mx + w / 2
+            cand = (a, b, c, d)
+        if cand[0] < -1e-6 or cand[1] < -1e-6 or cand[2] > W + 1e-6 or cand[3] > H + 1e-6:
+            return
+        rect = (cand[0] / W, cand[1] / H, (cand[2] - cand[0]) / W, (cand[3] - cand[1]) / H)
+        if self.crop_ok is not None and not self.crop_ok(rect):
+            return
+        self.crop_rect = rect
+        self.cropChanged.emit(rect)
+        self.update()
 
     # -- Interaktion
     def _changed(self):
@@ -311,7 +453,7 @@ class ImageView(QWidget):
         self.viewChanged.emit()
 
     def wheelEvent(self, e):
-        if not self.W:
+        if not self.W or self.crop_mode:
             return
         z, left, top, vw, vh = self.vrect()
         r = self.devicePixelRatioF()
@@ -329,10 +471,17 @@ class ImageView(QWidget):
         self._changed()
 
     def mousePressEvent(self, e):
+        if self.crop_mode and self.W:
+            if e.button() == Qt.LeftButton:
+                self._crop_press(e)
+            return
         if e.button() == Qt.LeftButton and self.W:
             self.drag = (e.position(), self.cx, self.cy)
 
     def mouseMoveEvent(self, e):
+        if self.crop_mode and self.W:
+            self._crop_move(e)
+            return
         if self.drag and self.W and not self.fit:
             r = self.devicePixelRatioF()
             p0, cx0, cy0 = self.drag
@@ -343,9 +492,13 @@ class ImageView(QWidget):
 
     def mouseReleaseEvent(self, e):
         self.drag = None
+        self._cdrag = None
 
     def mouseDoubleClickEvent(self, e):
         if not self.W:
+            return
+        if self.crop_mode:
+            self.cropDone.emit()
             return
         if self.fit:
             r = self.devicePixelRatioF()
@@ -358,7 +511,9 @@ class ImageView(QWidget):
         self._changed()
 
     def keyPressEvent(self, e):
-        if e.key() == Qt.Key_0:
+        if self.crop_mode and e.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Escape):
+            self.cropDone.emit()
+        elif e.key() == Qt.Key_0:
             self.fit = True
             self._changed()
         elif e.key() == Qt.Key_1 and self.W:
@@ -381,6 +536,346 @@ class ResetSlider(QSlider):
 
 
 # ---------------------------------------------------------------- Hauptfenster
+
+# ---------------------------------------------------------------- Graphen: Histogramm, Farbrad, Tonkurve
+class HistogramWidget(QWidget):
+    """RGB- + Luma-Histogramm des gerade angezeigten Bildes, mit Hinweis auf abgeschnittene Tiefen/Lichter."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(96)
+        self.bins = None            # (4, 256): R, G, B, Luma
+        self.clip = (0.0, 0.0)
+
+    def set_image(self, arr: np.ndarray):
+        a = arr[::3, ::3].reshape(-1, 3)
+        luma = (a @ np.array([0.2126, 0.7152, 0.0722], np.float32)).astype(np.uint8)
+        h = [np.bincount(a[:, c], minlength=256)[:256] for c in range(3)] + [np.bincount(luma, minlength=256)[:256]]
+        self.bins = np.array(h, np.float32)
+        n = max(1, a.shape[0])
+        self.clip = (float((a.min(1) == 0).sum() / n), float((a.max(1) == 255).sum() / n))
+        self.update()
+
+    def luma_bins(self):
+        return None if self.bins is None else self.bins[3]
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        r = self.rect().adjusted(0, 0, -1, -1)
+        p.fillRect(r, QColor(28, 28, 28))
+        p.setPen(QColor(60, 60, 60))
+        for k in range(1, 4):
+            p.drawLine(r.width() * k // 4, 0, r.width() * k // 4, r.height())
+        if self.bins is None:
+            return
+        top = float(np.percentile(self.bins[:3], 99.5)) or 1.0
+        W, H = r.width(), r.height() - 2
+        xs = np.linspace(0, W, 256)
+        cols = [QColor(255, 60, 60, 120), QColor(60, 220, 60, 120), QColor(70, 110, 255, 120), QColor(210, 210, 210, 70)]
+        p.setPen(Qt.NoPen)
+        for c in (3, 0, 1, 2):
+            poly = QPolygonF([QPointF(0, H + 1)] + [QPointF(xs[i], H + 1 - min(1.0, self.bins[c][i] / top) * H) for i in range(256)]
+                             + [QPointF(W, H + 1)])
+            p.setBrush(cols[c])
+            p.drawPolygon(poly)
+        if self.clip[0] > 0.005:
+            p.setBrush(QColor(80, 140, 255))
+            p.drawPolygon(QPolygonF([QPointF(2, 2), QPointF(12, 2), QPointF(2, 12)]))
+        if self.clip[1] > 0.005:
+            p.setBrush(QColor(255, 120, 80))
+            p.drawPolygon(QPolygonF([QPointF(W - 2, 2), QPointF(W - 12, 2), QPointF(W - 2, 12)]))
+
+
+class ColorWheel(QWidget):
+    """Farbrad: Position = Farbton (Winkel) und Saettigung (Abstand). Doppelklick setzt zurueck."""
+    changed = Signal(float, float)          # Farbton (Grad), Saettigung 0..100
+
+    def __init__(self, size=132):
+        super().__init__()
+        self.setFixedSize(size, size)
+        self.hue = 0.0
+        self.sat = 0.0
+        self._bg = None
+
+    def set_value(self, hue: float, sat: float):
+        self.hue, self.sat = hue % 360.0, min(max(sat, 0.0), 100.0)
+        self.update()
+
+    def _geom(self):
+        c = QPointF(self.width() / 2, self.height() / 2)
+        return c, min(self.width(), self.height()) / 2 - 5
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        c, R = self._geom()
+        cg = QConicalGradient(c, 0)
+        for k in range(13):
+            cg.setColorAt(k / 12.0, QColor.fromHsvF((k % 12) / 12.0, 1.0, 1.0))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(cg))
+        p.drawEllipse(c, R, R)
+        rg = QRadialGradient(c, R)
+        rg.setColorAt(0.0, QColor(128, 128, 128, 255))
+        rg.setColorAt(1.0, QColor(128, 128, 128, 0))
+        p.setBrush(QBrush(rg))
+        p.drawEllipse(c, R, R)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(20, 20, 20), 1.5))
+        p.drawEllipse(c, R, R)
+        a = math.radians(self.hue)
+        d = R * self.sat / 100.0
+        pt = QPointF(c.x() + d * math.cos(a), c.y() - d * math.sin(a))
+        p.setPen(QPen(QColor(255, 255, 255), 2))
+        p.setBrush(QColor(0, 0, 0, 60) if self.sat > 0 else QColor(255, 255, 255, 60))
+        p.drawEllipse(pt, 6, 6)
+
+    def _set_from(self, pos):
+        c, R = self._geom()
+        dx, dy = pos.x() - c.x(), -(pos.y() - c.y())
+        sat = min(1.0, math.hypot(dx, dy) / R) * 100.0
+        hue = math.degrees(math.atan2(dy, dx)) % 360.0 if sat > 0.5 else self.hue
+        self.hue, self.sat = hue, sat
+        self.update()
+        self.changed.emit(self.hue, self.sat)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._set_from(e.position())
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() & Qt.LeftButton:
+            self._set_from(e.position())
+
+    def mouseDoubleClickEvent(self, e):
+        self.hue, self.sat = self.hue, 0.0
+        self.update()
+        self.changed.emit(self.hue, 0.0)
+
+
+class CurveEditor(QWidget):
+    """Tonkurve: Punkte setzen (Klick), ziehen, entfernen (Doppelklick/Rechtsklick). Kanal: RGB, Rot, Gruen, Blau."""
+    changed = Signal(str, object)           # Schluessel ('curve', 'curve_r', ...), Punkteliste
+
+    KEYS = {"RGB": ("curve", QColor(235, 235, 235)), "Rot": ("curve_r", QColor(255, 90, 90)),
+            "Grün": ("curve_g", QColor(90, 220, 90)), "Blau": ("curve_b", QColor(100, 140, 255))}
+
+    def __init__(self, hist=None):
+        super().__init__()
+        self.setFixedSize(300, 300)
+        self.hist = hist
+        self.channel = "RGB"
+        self.curves = {k: [[0.0, 0.0], [1.0, 1.0]] for k, _ in self.KEYS.values()}
+        self.drag = None
+
+    def set_curves(self, s):
+        self.curves = {k: [list(p) for p in getattr(s, k)] for k, _ in self.KEYS.values()}
+        self.update()
+
+    def set_channel(self, name):
+        self.channel = name
+        self.update()
+
+    @property
+    def pts(self):
+        return self.curves[self.KEYS[self.channel][0]]
+
+    def _m(self):
+        return 10
+
+    def _to_w(self, x, y):
+        m = self._m()
+        return m + x * (self.width() - 2 * m), self.height() - m - y * (self.height() - 2 * m)
+
+    def _to_n(self, px, py):
+        m = self._m()
+        return (px - m) / (self.width() - 2 * m), (self.height() - m - py) / (self.height() - 2 * m)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.fillRect(self.rect(), QColor(28, 28, 28))
+        x0, y1 = self._to_w(0, 0)
+        x1, y0 = self._to_w(1, 1)
+        hb = self.hist.luma_bins() if self.hist is not None else None
+        if hb is not None:
+            top = float(np.percentile(hb, 99.5)) or 1.0
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(255, 255, 255, 28))
+            poly = QPolygonF([QPointF(x0, y1)] + [QPointF(x0 + (x1 - x0) * i / 255, y1 - min(1.0, hb[i] / top) * (y1 - y0))
+                                                 for i in range(256)] + [QPointF(x1, y1)])
+            p.drawPolygon(poly)
+        p.setPen(QPen(QColor(65, 65, 65), 1))
+        for k in range(5):
+            p.drawLine(x0 + (x1 - x0) * k / 4, y0, x0 + (x1 - x0) * k / 4, y1)
+            p.drawLine(x0, y0 + (y1 - y0) * k / 4, x1, y0 + (y1 - y0) * k / 4)
+        p.setPen(QPen(QColor(90, 90, 90), 1, Qt.DashLine))
+        p.drawLine(x0, y1, x1, y0)
+        for name, (key, col) in self.KEYS.items():
+            if name != self.channel and not grading.curve_is_identity(self.curves[key]):
+                self._draw_curve(p, self.curves[key], QColor(col.red(), col.green(), col.blue(), 90), 1.2)
+        col = self.KEYS[self.channel][1]
+        self._draw_curve(p, self.pts, col, 2.0)
+        p.setPen(QPen(QColor(20, 20, 20), 1))
+        p.setBrush(col)
+        for x, y in self.pts:
+            wx, wy = self._to_w(x, y)
+            p.drawEllipse(QPointF(wx, wy), 5, 5)
+
+    def _draw_curve(self, p, pts, col, width):
+        lut = grading.curve_lut(pts, 256)
+        p.setPen(QPen(col, width))
+        p.setBrush(Qt.NoBrush)
+        last = None
+        for i in range(256):
+            w = QPointF(*self._to_w(i / 255.0, float(lut[i])))
+            if last is not None:
+                p.drawLine(last, w)
+            last = w
+
+    def _nearest(self, pos, tol=9):
+        best, bi = tol, None
+        for i, (x, y) in enumerate(self.pts):
+            wx, wy = self._to_w(x, y)
+            d = math.hypot(pos.x() - wx, pos.y() - wy)
+            if d < best:
+                best, bi = d, i
+        return bi
+
+    def _emit(self):
+        self.changed.emit(self.KEYS[self.channel][0], [list(p) for p in self.pts])
+        self.update()
+
+    def mousePressEvent(self, e):
+        i = self._nearest(e.position())
+        if e.button() == Qt.RightButton:
+            if i is not None and len(self.pts) > 2:
+                del self.pts[i]
+                self._emit()
+            return
+        if i is None:
+            x, y = self._to_n(e.position().x(), e.position().y())
+            x, y = min(max(x, 0.0), 1.0), min(max(y, 0.0), 1.0)
+            if any(abs(px - x) < 0.02 for px, _ in self.pts):
+                return
+            self.pts.append([x, y])
+            self.pts.sort()
+            i = self.pts.index([x, y])
+            self._emit()
+        self.drag = i
+
+    def mouseMoveEvent(self, e):
+        if self.drag is None:
+            return
+        x, y = self._to_n(e.position().x(), e.position().y())
+        y = min(max(y, 0.0), 1.0)
+        i, pts = self.drag, self.pts
+        lo = pts[i - 1][0] + 0.01 if i > 0 else 0.0
+        hi = pts[i + 1][0] - 0.01 if i < len(pts) - 1 else 1.0
+        if i == 0:
+            x = min(max(x, 0.0), hi)
+        elif i == len(pts) - 1:
+            x = min(max(x, lo), 1.0)
+        else:
+            x = min(max(x, lo), hi)
+        pts[i] = [x, y]
+        self._emit()
+
+    def mouseReleaseEvent(self, e):
+        self.drag = None
+
+    def mouseDoubleClickEvent(self, e):
+        i = self._nearest(e.position())
+        if i is not None and len(self.pts) > 2:
+            del self.pts[i]
+            self._emit()
+
+
+class ExportDialog(QDialog):
+    """Format, Qualitaet und Groesse (Resize) fuer den Export."""
+    MODES = [("Originalgröße", None), ("Lange Kante (px)", "long"), ("Kurze Kante (px)", "short"),
+             ("Breite (px)", "width"), ("Höhe (px)", "height"), ("Prozent", "percent"), ("In Rahmen B × H (px)", "fit")]
+
+    def __init__(self, parent, qs, size):
+        super().__init__(parent)
+        self.setWindowTitle("Exportieren")
+        self.size_px = size
+        form = QFormLayout(self)
+        self.fmt = QComboBox()
+        self.fmt.addItems(["JPEG", "PNG", "TIFF"])
+        self.quality = QSpinBox()
+        self.quality.setRange(1, 100)
+        self.mode = QComboBox()
+        self.mode.addItems([m[0] for m in self.MODES])
+        self.v1, self.v2 = QSpinBox(), QSpinBox()
+        for sp in (self.v1, self.v2):
+            sp.setRange(1, 100000)
+        self.noup = QCheckBox("Nicht vergrößern")
+        self.info = QLabel("")
+        self.info.setStyleSheet("color:#999")
+        row = QHBoxLayout()
+        row.addWidget(self.v1)
+        row.addWidget(QLabel("×"))
+        row.addWidget(self.v2)
+        form.addRow("Format", self.fmt)
+        form.addRow("JPEG-Qualität", self.quality)
+        form.addRow("Größe", self.mode)
+        form.addRow("Wert", row)
+        form.addRow(self.noup)
+        form.addRow(self.info)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+        try:
+            self.fmt.setCurrentText(qs.value("exp_fmt", "JPEG"))
+            self.quality.setValue(int(qs.value("exp_q", 95)))
+            self.mode.setCurrentIndex(int(qs.value("exp_mode", 0)))
+            self.v1.setValue(int(qs.value("exp_v1", 2048)))
+            self.v2.setValue(int(qs.value("exp_v2", 2048)))
+            self.noup.setChecked(str(qs.value("exp_noup", "true")).lower() == "true")
+        except Exception:  # noqa: BLE001
+            self.quality.setValue(95)
+            self.noup.setChecked(True)
+        self._qs = qs
+        for w in (self.mode, self.v1, self.v2, self.noup):
+            (w.currentIndexChanged if isinstance(w, QComboBox) else w.valueChanged if isinstance(w, QSpinBox)
+             else w.toggled).connect(self._update)
+        self.fmt.currentTextChanged.connect(lambda t: self.quality.setEnabled(t == "JPEG"))
+        self.quality.setEnabled(self.fmt.currentText() == "JPEG")
+        self._update()
+
+    def options(self):
+        kind = self.MODES[self.mode.currentIndex()][1]
+        resize = None if kind is None else (("fit", self.v1.value(), self.v2.value()) if kind == "fit"
+                                            else (kind, self.v1.value()))
+        return dict(fmt={"JPEG": "jpg", "PNG": "png", "TIFF": "tif"}[self.fmt.currentText()],
+                    quality=self.quality.value(), resize=resize, no_upscale=self.noup.isChecked())
+
+    def _update(self, *_):
+        kind = self.MODES[self.mode.currentIndex()][1]
+        self.v1.setEnabled(kind is not None)
+        self.v2.setVisible(kind == "fit")
+        ow, oh = self.size_px
+        if ow:
+            z = resize_zoom(ow, oh, self.options()["resize"])
+            if self.noup.isChecked() and z > 1:
+                z = 1.0
+            self.info.setText(f"Aktuelles Bild: {ow} × {oh} px  →  {max(1, round(ow * z))} × {max(1, round(oh * z))} px")
+
+    def accept(self):
+        try:
+            self._qs.setValue("exp_fmt", self.fmt.currentText())
+            self._qs.setValue("exp_q", self.quality.value())
+            self._qs.setValue("exp_mode", self.mode.currentIndex())
+            self._qs.setValue("exp_v1", self.v1.value())
+            self._qs.setValue("exp_v2", self.v2.value())
+            self._qs.setValue("exp_noup", self.noup.isChecked())
+        except Exception:  # noqa: BLE001
+            pass
+        super().accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -432,6 +927,9 @@ class MainWindow(QMainWindow):
             sc.setContext(Qt.ApplicationShortcut)
             sc.activated.connect(lambda st=step: self.step_image(st))
         self.qs = QSettings("FujiSim", "FujiSim")
+        rs = QShortcut(QKeySequence(Qt.Key_R), self)
+        rs.setContext(Qt.WindowShortcut)
+        rs.activated.connect(lambda: self.crop_btn.setChecked(not self.crop_btn.isChecked()) if self.current else None)
 
     # ---- UI
     def _build_ui(self):
@@ -452,9 +950,13 @@ class MainWindow(QMainWindow):
 
         self.view = ImageView()
         self.view.viewChanged.connect(lambda: self.request_render(True))
+        self.view.cropChanged.connect(self.on_view_crop)
+        self.view.cropDone.connect(lambda: self.toggle_crop(False))
+        self.crop_mode = False
 
         panel = QWidget()
         pl = QVBoxLayout(panel)
+        self.hist = HistogramWidget()
 
         # Presets
         gp = QGroupBox("Presets")
@@ -472,6 +974,57 @@ class MainWindow(QMainWindow):
             self.preset_btns.append(b)
         pv.addLayout(prow)
         pl.addWidget(gp)
+
+        self.sliders: dict[str, tuple[QSlider, QLabel, float, int]] = {}
+        # Color Grading (3 Farbraeder + Global)
+        gcg = QGroupBox("Color Grading")
+        grid = QGridLayout(gcg)
+        self.wheels: dict[str, ColorWheel] = {}
+        for n, (pre, title) in enumerate((("cg_sh", "Schatten"), ("cg_mid", "Mitten"), ("cg_hi", "Lichter"), ("cg_gl", "Global"))):
+            cell = QVBoxLayout()
+            lab = QLabel(title)
+            lab.setAlignment(Qt.AlignCenter)
+            wheel = ColorWheel()
+            wheel.changed.connect(lambda h, sat, pre=pre: self.on_wheel(pre, h, sat))
+            self.wheels[pre] = wheel
+            sl = ResetSlider(0)
+            sl.setRange(-100, 100)
+            sl.setValue(0)
+            val = QLabel("0")
+            val.setFixedWidth(30)
+            val.setAlignment(Qt.AlignRight)
+            key = f"{pre}_l"
+            sl.valueChanged.connect(lambda v, k=key: self.on_slider(k, v))
+            self.sliders[key] = (sl, val, 1, 0)
+            srow = QHBoxLayout()
+            srow.addWidget(QLabel("Lum"))
+            srow.addWidget(sl, 1)
+            srow.addWidget(val)
+            cell.addWidget(lab)
+            cell.addWidget(wheel, 0, Qt.AlignHCenter)
+            cell.addLayout(srow)
+            grid.addLayout(cell, n // 2, n % 2)
+        pl.addWidget(gcg)
+
+        # Tonkurve
+        gcv = QGroupBox("Tonkurve")
+        cvl = QVBoxLayout(gcv)
+        self.curve_ed = CurveEditor(self.hist)
+        self.curve_ed.changed.connect(self.on_curve)
+        crow = QHBoxLayout()
+        self.curve_box = QComboBox()
+        self.curve_box.addItems(list(CurveEditor.KEYS))
+        self.curve_box.currentTextChanged.connect(self.curve_ed.set_channel)
+        creset = QPushButton("Kurve zurücksetzen")
+        creset.clicked.connect(self.reset_curves)
+        crow.addWidget(self.curve_box, 1)
+        crow.addWidget(creset)
+        cvl.addLayout(crow)
+        cvl.addWidget(self.curve_ed, 0, Qt.AlignHCenter)
+        cvl.addWidget(QLabel("Klick = Punkt setzen · ziehen = verschieben · Rechtsklick/Doppelklick = Punkt löschen"))
+        cvl.itemAt(2).widget().setStyleSheet("color:#999; font-size:10px")
+        cvl.itemAt(2).widget().setWordWrap(True)
+        pl.addWidget(gcv)
 
         # Film-Auswahl
         gb = QGroupBox("Fuji: Film Simulation")
@@ -498,7 +1051,6 @@ class MainWindow(QMainWindow):
             self.combos[key] = cb
         pl.addWidget(gbc)
 
-        self.sliders: dict[str, tuple[QSlider, QLabel, float, int]] = {}
         defaults = EditSettings()
         for title, items in SLIDER_GROUPS:
             box = QGroupBox(title)
@@ -507,6 +1059,36 @@ class MainWindow(QMainWindow):
                 self.auto_chk = QCheckBox("Kamera-Belichtung (fest, wie die Kamera)")
                 self.auto_chk.toggled.connect(lambda v: self.set_value("auto_exposure", v))
                 form.addRow(self.auto_chk)
+            if title.startswith("Geometrie"):
+                self.crop_btn = QPushButton("Zuschneiden (R)")
+                self.crop_btn.setCheckable(True)
+                self.crop_btn.toggled.connect(self.toggle_crop)
+                self.aspect_box = QComboBox()
+                self.aspect_box.addItems(list(geometry.ASPECTS))
+                self.aspect_box.currentTextChanged.connect(self.on_aspect)
+                swap = QPushButton("⇄")
+                swap.setToolTip("Hoch-/Querformat tauschen")
+                swap.setFixedWidth(34)
+                swap.clicked.connect(self.swap_aspect)
+                arow = QHBoxLayout()
+                arow.addWidget(self.aspect_box, 1)
+                arow.addWidget(swap)
+                form.addRow(self.crop_btn)
+                form.addRow("Seitenverhältnis", arow)
+                grow = QHBoxLayout()
+                for text, tip, fn in (("⟲ 90°", "90° gegen den Uhrzeigersinn", lambda: self.rotate90(-1)),
+                                      ("⟳ 90°", "90° im Uhrzeigersinn", lambda: self.rotate90(1)),
+                                      ("↔", "Horizontal spiegeln", lambda: self.flip("h")),
+                                      ("↕", "Vertikal spiegeln", lambda: self.flip("v"))):
+                    b = QPushButton(text)
+                    b.setToolTip(tip)
+                    b.clicked.connect(fn)
+                    grow.addWidget(b)
+                form.addRow(grow)
+                rb = QPushButton("Zuschnitt && Drehung zurücksetzen")
+                rb.clicked.connect(self.reset_geometry)
+                form.addRow(rb)
+                self.geo_widgets = [self.crop_btn, self.aspect_box, swap, rb]
             if title.startswith("Eigene LUT"):
                 row = QHBoxLayout()
                 self.lut_label = QLabel("keine")
@@ -574,12 +1156,18 @@ class MainWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(panel)
-        scroll.setFixedWidth(400)
+        right = QWidget()
+        right.setFixedWidth(400)
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(2)
+        rl.addWidget(self.hist)
+        rl.addWidget(scroll, 1)
 
         split = QSplitter()
         split.addWidget(self.list)
         split.addWidget(self.view)
-        split.addWidget(scroll)
+        split.addWidget(right)
         split.setStretchFactor(1, 1)
         self.setCentralWidget(split)
         self.statusBar().showMessage("Bereit")
@@ -598,7 +1186,32 @@ class MainWindow(QMainWindow):
             self.list.scrollToItem(self.list.currentItem())
 
     # ---- Sitzung merken / wiederherstellen
+    def _saved_edits(self) -> dict:
+        if not hasattr(self, "_saved"):
+            try:
+                self._saved = json.loads(self.qs.value("edits", "{}"))
+            except Exception:  # noqa: BLE001
+                self._saved = {}
+        return self._saved
+
+    def save_edits(self):
+        """Bearbeitungen aller geladenen Bilder merken (Bilder ausserhalb der Liste bleiben erhalten)."""
+        try:
+            saved = self._saved_edits()
+            base = asdict(app_defaults())
+            for path, s in self.settings.items():
+                d = asdict(s)
+                if d == base:
+                    saved.pop(path, None)
+                else:
+                    saved[path] = d
+            self.qs.setValue("edits", json.dumps(saved))
+            self.qs.sync()
+        except Exception:  # noqa: BLE001
+            pass
+
     def save_session(self):
+        self.save_edits()
         try:
             self.qs.setValue("paths", json.dumps(list(self.settings)))
             self.qs.setValue("current", self.current or "")
@@ -650,7 +1263,7 @@ class MainWindow(QMainWindow):
 
     def set_controls_enabled(self, on: bool):
         for w in (self.sim_box, self.auto_chk, self.apply_btn, self.before_btn, self.preset_box,
-                  *self.preset_btns, *self.combos.values()):
+                  *self.preset_btns, *self.combos.values(), *self.geo_widgets):
             w.setEnabled(on)
         for sl, *_ in self.sliders.values():
             sl.setEnabled(on)
@@ -685,7 +1298,9 @@ class MainWindow(QMainWindow):
             sp = str(f)
             if sp in self.settings:
                 continue
-            self.settings[sp] = app_defaults()
+            d = self._saved_edits().get(sp)
+            self.settings[sp] = (EditSettings.from_dict({**asdict(app_defaults()), **d})
+                                 if d else app_defaults())
             it = QListWidgetItem(f.name)
             it.setData(Qt.UserRole, sp)
             it.setSizeHint(QSize(THUMB_W + 24, THUMB_H + 30))
@@ -724,7 +1339,13 @@ class MainWindow(QMainWindow):
     def on_select(self, item, _prev):
         if item is None:
             return
+        self.save_edits()
         self.current = item.data(Qt.UserRole)
+        if self.crop_mode:
+            self.crop_mode = False
+            self.crop_btn.blockSignals(True)
+            self.crop_btn.setChecked(False)
+            self.crop_btn.blockSignals(False)
         self.set_controls_enabled(True)
         self.refresh_controls(self.settings[self.current])
         self.session = None                      # Speicher des vorherigen Bildes freigeben
@@ -753,13 +1374,139 @@ class MainWindow(QMainWindow):
             return                                # veraltet -> sess wird freigegeben
         self.session = sess
         self.load_timer.stop()
-        self.view.set_size(sess.W, sess.H, reset=True)
+        self.sync_view(True)
         self.request_render(False)
 
     def on_full_ready(self, serial):
         if serial != self.load_serial or self.session is None:
             return
-        self.view.set_size(self.session.W, self.session.H, reset=False)
+        self.sync_view(False)
+        self.request_render(False)
+
+    # ---- Geometrie (Zuschneiden, Drehen, Spiegeln)
+    def view_settings(self, s: EditSettings) -> EditSettings:
+        """Im Zuschneiden-Modus wird die ganze (gedrehte) Arbeitsflaeche gezeigt, der Rahmen liegt als Overlay darueber."""
+        if self.crop_mode:
+            v = s.copy()
+            v.crop_x = v.crop_y = 0.0
+            v.crop_w = v.crop_h = 1.0
+            return v
+        return s
+
+    def _ratio(self, s: EditSettings) -> float:
+        name = s.crop_aspect
+        if name == "Frei":
+            return 0.0
+        if name == "Original" and self.session is not None:
+            cw, ch = geometry.canvas_size(s, self.session.W, self.session.H)
+            return cw / ch
+        return geometry.ASPECTS.get(name) or 0.0
+
+    def sync_view(self, reset: bool):
+        """Bildgroesse der Ansicht (Ergebnis bzw. Arbeitsflaeche), Zuschnitt-Overlay und Seitenverhaeltnis abgleichen."""
+        if self.session is None or not self.current:
+            return
+        s = self.settings[self.current]
+        sv = self.view_settings(s)
+        ow, oh = geometry.out_size(sv, self.session.W, self.session.H)
+        self.view.set_size(ow, oh, reset=reset)
+        self.view.crop_mode = self.crop_mode
+        self.view.crop_rect = (s.crop_x, s.crop_y, s.crop_w, s.crop_h)
+        self.view.crop_ratio = self._ratio(s)
+        W, H = self.session.W, self.session.H
+        self.view.crop_ok = lambda r, s=s: geometry.inside_fraction(s, W, H, rect=r) >= 0.9999
+        self.view.update()
+
+    def toggle_crop(self, on: bool):
+        if not self.current:
+            return
+        self.crop_mode = bool(on)
+        if self.crop_btn.isChecked() != self.crop_mode:
+            self.crop_btn.blockSignals(True)
+            self.crop_btn.setChecked(self.crop_mode)
+            self.crop_btn.blockSignals(False)
+        if self.session is not None and not self.crop_mode:
+            geometry.fit_crop(self.settings[self.current], self.session.W, self.session.H)
+        self.sync_view(True)
+        self.request_render(False)
+        self.view.setFocus()
+        self.statusBar().showMessage("Zuschneiden: Rahmen ziehen, Enter oder Doppelklick = fertig" if self.crop_mode
+                                     else "Zuschnitt übernommen", 6000)
+
+    def on_view_crop(self, rect):
+        if self.current:
+            s = self.settings[self.current]
+            s.crop_x, s.crop_y, s.crop_w, s.crop_h = rect
+            if self.session is not None:
+                ow, oh = geometry.out_size(s, self.session.W, self.session.H)
+                self.statusBar().showMessage(f"Zuschnitt {ow} × {oh} px")
+
+    def on_aspect(self, name):
+        if self.loading_ui or not self.current or self.session is None:
+            return
+        s = self.settings[self.current]
+        s.crop_aspect = name
+        ratio = self._ratio(s)
+        if name == "Original":
+            s.crop_x = s.crop_y = 0.0
+            s.crop_w = s.crop_h = 1.0
+            geometry.fit_crop(s, self.session.W, self.session.H)
+        elif ratio > 0:
+            geometry.aspect_crop(s, self.session.W, self.session.H, ratio)
+        self.sync_view(not self.crop_mode)
+        self.request_render(False)
+
+    def swap_aspect(self):
+        inv = {"4:5": "5:4", "5:4": "4:5", "3:2": "2:3", "2:3": "3:2", "16:9": "9:16", "9:16": "16:9",
+               "4:3": "3:4", "3:4": "4:3"}
+        name = self.aspect_box.currentText()
+        if name in inv:
+            self.aspect_box.setCurrentText(inv[name])       # loest on_aspect aus
+
+    def rotate90(self, d: int):
+        if not self.current:
+            return
+        s = self.settings[self.current]
+        x, y, w, h = s.crop_x, s.crop_y, s.crop_w, s.crop_h
+        if d > 0:       # im Uhrzeigersinn: Zuschnitt dreht mit
+            s.crop_x, s.crop_y, s.crop_w, s.crop_h = 1 - y - h, x, h, w
+        else:
+            s.crop_x, s.crop_y, s.crop_w, s.crop_h = y, 1 - x - w, h, w
+        s.rot90 = (s.rot90 + d) % 4
+        self.sync_view(True)
+        self.request_render(False)
+
+    def flip(self, axis: str):
+        """Spiegelt das *Ergebnis* (nicht die Quelle): bei ungerader 90°-Drehung vertauschen sich die Achsen."""
+        if not self.current:
+            return
+        s = self.settings[self.current]
+        odd = s.rot90 % 2 == 1
+        if axis == "h":
+            if odd:
+                s.flip_v = not s.flip_v
+            else:
+                s.flip_h = not s.flip_h
+            s.crop_x = 1 - s.crop_x - s.crop_w
+        else:
+            if odd:
+                s.flip_h = not s.flip_h
+            else:
+                s.flip_v = not s.flip_v
+            s.crop_y = 1 - s.crop_y - s.crop_h
+        s.angle = -s.angle if s.angle else 0.0
+        self.refresh_controls(s)
+        self.sync_view(True)
+        self.request_render(False)
+
+    def reset_geometry(self):
+        if not self.current:
+            return
+        s = self.settings[self.current]
+        for k in GEOMETRY_KEYS:
+            setattr(s, k, getattr(EditSettings(), k))
+        self.refresh_controls(s)
+        self.sync_view(True)
         self.request_render(False)
 
     # ---- Rendern (Ausschnitt in Bildschirmaufloesung)
@@ -774,7 +1521,9 @@ class MainWindow(QMainWindow):
         s = self.settings[self.current].copy()
         if self.show_before:
             s = EditSettings(sim="Neutral", exposure=s.exposure, auto_exposure=s.auto_exposure,
-                             wb_mode=s.wb_mode, wb_kelvin=s.wb_kelvin)
+                             wb_mode=s.wb_mode, wb_kelvin=s.wb_kelvin,
+                             **{k: getattr(s, k) for k in GEOMETRY_KEYS})
+        s = self.view_settings(s)
         self.render_serial += 1
         self.worker.post_render(dict(load=self.load_serial, serial=self.render_serial, session=self.session,
                                      s=s, z=zr, X0=X0, Y0=Y0, cw=cw, ch=ch, meta=(zr, X0, Y0), q=q))
@@ -785,6 +1534,8 @@ class MainWindow(QMainWindow):
         q = meta[0] / max(self.view.eff_zoom(), 1e-9)
         self.full_time = 0.6 * self.full_time + 0.4 * secs / max(q * q, 0.1)
         self.view.set_image(to_qimage(arr), meta)
+        self.hist.set_image(arr)
+        self.curve_ed.update()
         mb = (self.session.W * self.session.H) / 1e6 if self.session else 0
         info = "voll" if (self.session and self.session.has_full) else "Vorschau (volle Auflösung lädt…)"
         if self.session and self.session.gain_info:
@@ -803,6 +1554,10 @@ class MainWindow(QMainWindow):
             sl.setValue(round(getattr(s, key) * scale))
             val.setText(f"{getattr(s, key):.{dec}f}")
         self.lut_label.setText(Path(s.lut_path).name if s.lut_path else "keine")
+        self.aspect_box.setCurrentText(s.crop_aspect)
+        for pre, wheel in self.wheels.items():
+            wheel.set_value(getattr(s, f"{pre}_h"), getattr(s, f"{pre}_s"))
+        self.curve_ed.set_curves(s)
         self.update_note(s.sim)
         self.loading_ui = False
 
@@ -810,6 +1565,9 @@ class MainWindow(QMainWindow):
         if self.loading_ui or not self.current:
             return
         setattr(self.settings[self.current], key, value)
+        if key == "angle" and self.session is not None:
+            geometry.fit_crop(self.settings[self.current], self.session.W, self.session.H)
+            self.sync_view(False)
         self.request_render(True)
 
     def on_slider(self, key, raw):
@@ -818,8 +1576,33 @@ class MainWindow(QMainWindow):
         val.setText(f"{v:.{dec}f}")
         self.set_value(key, v)
 
+    def on_wheel(self, pre, hue, sat):
+        if self.loading_ui or not self.current:
+            return
+        s = self.settings[self.current]
+        setattr(s, f"{pre}_h", float(hue))
+        setattr(s, f"{pre}_s", float(sat))
+        self.request_render(True)
+
+    def on_curve(self, key, pts):
+        if self.loading_ui or not self.current:
+            return
+        setattr(self.settings[self.current], key, [list(map(float, p)) for p in pts])
+        self.request_render(True)
+
+    def reset_curves(self):
+        if not self.current:
+            return
+        s = self.settings[self.current]
+        ident = EditSettings()
+        for k in ("curve", "curve_r", "curve_g", "curve_b"):
+            setattr(s, k, [list(p) for p in getattr(ident, k)])
+        self.curve_ed.set_curves(s)
+        self.request_render(False)
+
     def update_note(self, name):
         src = ("Offizielle Fuji-LUT" if name in flog.available_sims()
+               else f"abgeleitet aus {flog.DERIVED[name]}-LUT + gelernte Korrektur" if name in flog.DERIVED
                else "Näherung (keine Fuji-LUT vorhanden)")
         self.note.setText(f"{src} – {FILMS[name].note}" if name in FILMS else src)
 
@@ -877,7 +1660,11 @@ class MainWindow(QMainWindow):
 
     def reset_current(self):
         if self.current:
-            self.settings[self.current] = app_defaults()
+            old = self.settings[self.current]
+            new = EditSettings()      # echte Defaults (alle Regler neutral), nicht die Startwerte neuer Bilder
+            for k in GEOMETRY_KEYS:   # Zuschnitt/Drehung haben einen eigenen Zuruecksetzen-Knopf
+                setattr(new, k, getattr(old, k))
+            self.settings[self.current] = new
             self.refresh_controls(self.settings[self.current])
             self.request_render(False)
 
@@ -995,6 +1782,8 @@ class MainWindow(QMainWindow):
             if path == self.current:
                 continue
             new = src.copy()
+            for k in GEOMETRY_KEYS:                    # Zuschnitt/Drehung sind immer pro Bild
+                setattr(new, k, getattr(self.settings[path], k))
             if self.keep_chk.isChecked():
                 for k in PER_IMAGE_KEYS:
                     setattr(new, k, getattr(self.settings[path], k))
@@ -1007,6 +1796,12 @@ class MainWindow(QMainWindow):
     def export(self, all_images: bool):
         if not self.current:
             return
+        s0 = self.settings[self.current]
+        size = (geometry.out_size(s0, self.session.W, self.session.H) if self.session is not None else (0, 0))
+        dlg = ExportDialog(self, self.qs, size)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        opt = dlg.options()
         outdir = QFileDialog.getExistingDirectory(self, "Ausgabeordner")
         if not outdir:
             return
@@ -1015,7 +1810,7 @@ class MainWindow(QMainWindow):
         self.progress = QProgressDialog("Exportiere…", "Abbrechen", 0, len(jobs), self)
         self.progress.setWindowModality(Qt.WindowModal)
         self.progress.setMinimumDuration(0)
-        self.export_task = ExportTask(self, jobs, outdir, "jpg", 95, 0)
+        self.export_task = ExportTask(self, jobs, outdir, opt["fmt"], opt["quality"], opt["resize"], opt["no_upscale"])
         self.progress.canceled.connect(lambda: setattr(self.export_task, "cancel", True))
         self.export_pool.start(self.export_task)
 

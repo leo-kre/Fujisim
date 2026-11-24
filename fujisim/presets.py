@@ -7,10 +7,10 @@ import re
 from dataclasses import asdict
 from pathlib import Path
 
-from .settings import EditSettings
+from .settings import GEOMETRY_KEYS, EditSettings
 
 # Pro Bild individuell -> gehoert nicht in ein Preset
-EXCLUDE = ("auto_exposure", "exposure")
+EXCLUDE = ("auto_exposure", "exposure") + GEOMETRY_KEYS
 _MARKER = ".defaults_installed"
 
 

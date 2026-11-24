@@ -27,6 +27,23 @@ mit WB Shift R/B (−9…+9), Acros-Filter, Monochromatic Color (WC/MG), Belicht
 „White Balance: Auto, +2 Red & -5 Blue“ …). **Rezept kopieren** gibt die aktuellen Werte im selben Format aus.
 Zusätze (nicht in der Kamera): Halation, Bloom, Vignette, Kontrast, Intensität, eigene LUT.
 
+## Geometrie & Grundlagen
+- **Zuschneiden** (Knopf oder Taste `R`): Rahmen an Ecken/Kanten ziehen, in der Mitte verschieben; Enter/Doppelklick = fertig.
+  Seitenverhältnisse: Original, Frei, 1:1, 4:5, 3:2, 16:9 … (⇄ tauscht Hoch/Quer). Der Rahmen bleibt immer im Bild.
+- **Gerade ausrichten** (Regler −45…+45°), **90° drehen**, **Spiegeln** horizontal/vertikal, „Zuschnitt & Drehung zurücksetzen“.
+  Geometrie gilt pro Bild: sie wird weder von Presets noch von „Apply to all“ noch von „Zurücksetzen“ überschrieben.
+- **Grundlagen**: Sättigung, Dynamik (Vibrance), Weiß, Schwarz.
+- **Export-Dialog**: JPEG/PNG/TIFF, Qualität, Größe: Original, lange/kurze Kante, Breite, Höhe, Prozent oder „In Rahmen B × H“,
+  optional „Nicht vergrößern“. Zuschnitt und Drehung werden mit exportiert.
+
+## Graphen & Color Grading
+- **Histogramm** (oben im Panel): RGB + Helligkeit des angezeigten Bildes; Dreiecke oben links/rechts warnen bei abgeschnittenen Tiefen/Lichtern.
+- **Color Grading**: Farbräder für Schatten, Mitten, Lichter und Global (Farbton = Winkel, Sättigung = Abstand, Doppelklick = zurück)
+  mit je einem Luminanz-Regler; **Überblendung** und **Balance** steuern Breite und Lage der Zonen.
+- **Tonkurve**: Punktkurve für RGB sowie Rot/Grün/Blau einzeln. Klick = Punkt setzen, ziehen = verschieben, Rechtsklick/Doppelklick = löschen.
+  Das Luma-Histogramm liegt hinter der Kurve.
+- Räder und Kurven gehören zum Look: sie werden in Presets gespeichert (Zuschnitt/Drehung nicht).
+
 ## Presets
 Im Panel oben: Preset wählen (wendet es auf das aktuelle Bild an, Belichtung bleibt), **Speichern als…**
 (fragt bei vorhandenem Namen nach, ob überschrieben wird), **Überschreiben** (ersetzt das gewählte Preset
